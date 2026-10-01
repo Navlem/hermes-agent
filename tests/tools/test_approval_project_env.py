@@ -1,5 +1,7 @@
 """Project env write contracts through both public detector import surfaces."""
 
+import re
+
 import pytest
 
 from tools import approval, approval_detection
@@ -19,6 +21,45 @@ def home(request, monkeypatch):
 
 
 class TestEnvrcAndProjectEnvInPlaceEdits:
+    @pytest.mark.parametrize("native_separators", [False, True], ids=["spaced-posix", "native"])
+    def test_sed_home_operands_preserve_word_identity(self, detector, tmp_path, monkeypatch, native_separators):
+        user_home = str(tmp_path / ("user-home" if native_separators else "user home"))
+        hermes_home = str(tmp_path / ("hermes-home" if native_separators else "hermes home"))
+        monkeypatch.setenv("HOME", user_home)
+        monkeypatch.setenv("HERMES_HOME", hermes_home)
+        for path in [user_home + "/.bashrc", hermes_home + "/config.yaml"]:
+            if native_separators:
+                path = path.replace("/", "\\")
+            # These are classifier inputs, not commands executed on this host.
+            operand = path if native_separators else f'"{path}"'
+            result = detector(f"sed -ni 's/a/b/' {operand}")
+            assert result[0] and result[1] and result[2], (operand, result)
+            assert detector(f"sed -n 's/a/b/' {operand}") == (False, None, None)
+            assert detector(f"sed -i -e {operand} README.md") == (False, None, None)
+            assert detector(f"sed -ni 's/a/b/' \"{path}.example\"") == (False, None, None)
+
+    def test_sed_inventory_slash_marks_subtree_not_filename_prefix(self, detector, monkeypatch):
+        # Extend only this test's inventory, without importing another policy's names.
+        inventory = approval_detection._SED_USER_TARGET_RE
+        monkeypatch.setattr(approval_detection, "_SED_USER_TARGET_RE", re.compile(
+            rf"(?:{inventory.pattern}|~/\.sed-test-subtree/)", inventory.flags,
+        ))
+        for path, expected in [
+            ("~/.sed-test-subtree/", True),
+            ("~/.sed-test-subtree/token", True),
+            ("~/.sed-test-subtree/nested/token with spaces", True),
+            ("~/.sed-test-subtree.example/token", False),
+            ("~/.bashrc", True),
+            ("~/.bashrc.example", False),
+            ("~/.bashrc/child", False),
+        ]:
+            operand = f'"{path}"'
+            result = detector(f"sed -ni 's/a/b/' {operand}")
+            assert result[0] is expected, (path, result)
+            assert bool(result[1]) is expected
+            assert detector(f"sed -n 's/a/b/' {operand}") == (False, None, None)
+            assert detector(f"sed -i -e {operand} README.md") == (False, None, None)
+
     @pytest.mark.parametrize("path", [".env", "app/.envrc", "~/.bashrc", "~/.hermes/config.yaml", "/etc/security-test"])
     @pytest.mark.parametrize("flag,expected", [("-i", True), ("--in-place", True), ("--posix", False), ("-n", False)])
     def test_sed_in_place_on_project_env_is_gated(self, detector, home, path, flag, expected):

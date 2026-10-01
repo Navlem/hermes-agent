@@ -1571,7 +1571,12 @@ def _sed_in_place_findings(command: str):
     for start, _, word in _iter_shell_command_word_spans(command):
         if os.path.basename(_deobfuscate_shell_word_for_detection(word)) != "sed":
             continue
-        args = _sed_command_tokens(_shell_command_segment(command, start))
+        # Fold source words before argv decoding dissolves native separators or
+        # removes the quotes that keep spaced HOME prefixes in one operand.
+        segment = _rewrite_resolved_user_home(
+            _rewrite_resolved_hermes_home(_shell_command_segment(command, start))
+        )
+        args = _sed_command_tokens(segment)
         if not args:
             continue
         in_place, options, explicit_program = False, True, False
@@ -1606,12 +1611,19 @@ def _sed_in_place_findings(command: str):
             continue
         # Without -e/-f the first positional is sed's program, not an input file.
         for operand in operands if explicit_program else operands[1:]:
-            target = _normalize_command_for_detection(operand)
+            # An argv operand is one word even when it contains spaces.
+            target = _strip_shell_word_syntax(_normalize_command_for_detection(shlex.quote(operand)))
+            user_target = _SED_USER_TARGET_RE.match(target)
+            # A slash-terminated inventory match marks a protected subtree;
+            # bare filename entries must still consume the entire operand.
+            sensitive_user_target = user_target is not None and (
+                user_target.end() == len(target) or user_target.group().endswith("/")
+            )
             if _SED_SYSTEM_TARGET_RE.match(target):
                 yield "in-place edit of system config"
             elif _SED_HERMES_TARGET_RE.fullmatch(target):
                 yield "in-place edit of Hermes config/env"
-            elif _SED_SSH_TARGET_RE.match(target) or _SED_USER_TARGET_RE.fullmatch(target):
+            elif _SED_SSH_TARGET_RE.match(target) or sensitive_user_target:
                 yield "in-place edit of sensitive credential/SSH/shell-rc path"
             elif _SED_PROJECT_BASENAME_RE.fullmatch(os.path.basename(target)):
                 yield "in-place edit of project env file"
