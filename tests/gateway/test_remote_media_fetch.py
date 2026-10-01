@@ -56,6 +56,24 @@ def test_sandbox_artifact_is_fetched_but_credentials_and_symlinks_to_them_are_no
     assert remote_env.fetched == ["/home/agent/out/report.txt", "/home/agent/out/report.txt"]
 
 
+@pytest.mark.parametrize("name", [".netrc", ".pgpass", ".npmrc", ".pypirc", ".git-credentials"])
+@pytest.mark.parametrize("home", ["/root", "/home/agent", None])
+def test_remote_fallback_cannot_deliver_home_secret_files(remote_env, name, home):
+    """The real filter's remote retry must not undo the host's HOME-file denial."""
+    remote_env._remote_home = home
+    prefix = home or "/home/agent"
+    secret = prefix + "/" + name
+    ordinary = secret + "backup"
+    alias = prefix + "/out/secret-alias.txt"
+    remote_env.files = {secret: b"placeholder credential bytes\n", ordinary: b"ordinary artifact\n"}
+    remote_env.links = {alias: secret}
+    delivered = BasePlatformAdapter.filter_media_delivery_paths([
+        (secret, False), (alias, False), (ordinary, True),
+    ])
+    assert [(Path(path).read_bytes(), voice) for path, voice in delivered] == [(b"ordinary artifact\n", True)]
+    assert remote_env.fetched == [ordinary]
+
+
 def test_local_backend_and_strict_mode_do_not_fetch(monkeypatch, tmp_path, remote_env):
     """Strict mode keeps its recency gate: a fetched copy would land in an allowlisted root and skip it."""
     monkeypatch.setenv("HERMES_MEDIA_DELIVERY_STRICT", "1")
