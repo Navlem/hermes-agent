@@ -7,6 +7,7 @@ prompting live here.
 import functools
 import logging
 import os
+import posixpath
 import re
 import shlex
 import tempfile
@@ -393,7 +394,10 @@ DANGEROUS_PATTERNS = [
     # implant), `cp creds ~/.netrc`, and `cp evil ~/.bashrc` (login-time command injection) slipped through
     # with auto-approve. Same unpaired-door rationale as #14639 / the sed-tee-redirect pairing on these
     # targets. `authorized_keys` after the `~/.ssh/` fragment).
-    (rf'\b(cp|mv|install)\b.*\s["\']?{_SENSITIVE_WRITE_TARGET}[^\s"\']*["\']?{_COMMAND_TAIL}', "copy/move file into sensitive credential/SSH/shell-rc path"),
+    # Quoted destinations may contain spaces; unquoted destinations stop at whitespace.
+    (rf'\b(cp|mv|install)\b.*\s(?:"{_SENSITIVE_WRITE_TARGET}[^"\n]*"|'
+     rf'\'{_SENSITIVE_WRITE_TARGET}[^\'\n]*\'|{_SENSITIVE_WRITE_TARGET}[^\s"\']*){_COMMAND_TAIL}',
+     "copy/move file into sensitive credential/SSH/shell-rc path"),
     # In-place edits mutate the file directly, bypassing redirection/tee/cp coverage; gate the same
     # startup/credential files.
     (rf'\bsed\s+-[^\s]*i.*(?:{_USER_SENSITIVE_WRITE_TARGET})[^\s"\']*', "in-place edit of sensitive credential/SSH/shell-rc path"),
@@ -526,33 +530,87 @@ def _lower_preserving_flags(command: str) -> str:
     return ''.join(t if t.startswith('-') else t.lower() for t in re.split(r'(\s+)', command))
 
 
-# Shell metacharacters, quotes, and whitespace that terminate a path token.
-_PATH_TOKEN_STOP = r"""\s'"`;|&<>()"""
-_PATH_TAIL = r"(?P<tail>(?:[/\\][^/\\" + _PATH_TOKEN_STOP + r"]*)+)"
+# Matched only against a complete, scanner-delimited and decoded shell word.
+_PATH_TAIL = r"(?P<tail>[/\\].+)"
 
 
 @functools.lru_cache(maxsize=64)
 def _home_prefix_fold_regex(path: str):
-    """Compile a regex matching *path* as an absolute directory prefix.
-    Components match with either separator so native Windows, forward-slash, and mixed forms all
-    fold; the caller normalizes the tail's backslashes to ``/``. A non-empty tail is required, so a
-    bare home is never folded. Returns ``None`` for an unset/degenerate path (fewer than two
-    components: ``/``, ``C:\\``, ``""``) so a stray HOME cannot rewrite unrelated prefixes."""
+    """Match a validated absolute HOME as a complete word's directory prefix.
+
+    Single-component POSIX homes (``/root``) are directories, not filesystem roots.
+    Drive roots, bare UNC hosts, empty/relative homes and drive-looking ``/C:`` are
+    refused. Windows/UNC components accept either separator; the word scanner and
+    ``fullmatch`` enforce the left/right boundaries. A descendant is required.
+    """
     components = [c for c in re.split(r"[/\\]+", path) if c] if path else []
-    if len(components) < 2:
+    if len(components) < 2 and not (
+        path.startswith("/") and not path.startswith("//")
+        and components and ":" not in components[0] and "\\" not in path
+    ):
         return None
-    # Optional leading root separator; a Windows drive letter is a component.
-    return re.compile(r"[/\\]*" + r"[/\\]+".join(re.escape(c) for c in components) + _PATH_TAIL)
+    drive = re.match(r"^[A-Za-z]:[/\\]", path)
+    if not drive and not path.startswith(("/", "\\\\")):
+        return None
+    root = "" if drive else r"[/\\]+"
+    return re.compile(root + r"[/\\]+".join(re.escape(c) for c in components) + _PATH_TAIL)
 
 
 def _fold_home_prefixes(command: str, paths, replacement: str) -> str:
-    """Fold each resolved home prefix in *command* to *replacement* (no trailing separator; the tail
-    supplies it). Longest first so a deeper home folds before a shorter overlapping one that would clobber it."""
-    for path in dict.fromkeys(sorted((p for p in paths if p), key=len, reverse=True)):
-        pattern = _home_prefix_fold_regex(path)
-        if pattern is not None:
-            command = pattern.sub(lambda m: replacement + m.group("tail").replace("\\", "/"), command)
-    return command
+    """Fold only a shell word's absolute prefix, never a substring of another path."""
+    patterns = [pattern for path in dict.fromkeys(sorted((p for p in paths if p), key=len, reverse=True))
+                if (pattern := _home_prefix_fold_regex(path)) is not None]
+    edits, start = [], None
+
+    def fold(start: int, end: int) -> None:
+        word = command[start:end]
+        # Native drive/UNC spellings use backslashes as separators, not shell escapes.
+        unquoted = word.strip("'\"")
+        windows = re.match(r"^[A-Za-z]:[/\\]", unquoted) or unquoted.startswith("\\\\")
+        value = ("".join(word[i:j] for kind, i, j, _ in _scan_shell(word) if kind != "quote")
+                 if windows else _strip_shell_word_syntax(word))
+        if windows:
+            value = value.replace("\\", "/")
+        if replacement == "~":
+            symbolic = re.match(r"^(?:~|\$HOME|\$\{HOME\})(?=/)", value)
+            if symbolic and paths:
+                value = paths[0].replace("\\", "/") + value[symbolic.end():]
+        # This is lexical path equivalence only, not variable/glob expansion or symlink resolution.
+        if any(char in value for char in "$`*?[]{}"):
+            return
+        value = posixpath.normpath(value)
+        for pattern in patterns:
+            match = pattern.fullmatch(value)
+            if match:
+                folded = replacement + match.group("tail").replace("\\", "/")
+                # Don't introduce quotes into an ordinary bare operand: legacy rules for
+                # options after operands deliberately stop at quoted prose.
+                rendered = (shlex.quote(folded) if re.search(r"[\s'\";&|<>()`\\]", folded)
+                            or "'" in word or '"' in word else folded)
+                edits.append((start, end, rendered))
+                break
+
+    for kind, i, j, quote in _scan_shell(command, subst="uq", comments=True):
+        if kind == "subst":
+            opener = 2 if command.startswith("$(", i) else 1
+            body = command[i + opener:j - 1]
+            folded_body = _fold_home_prefixes(body, paths, replacement)
+            if folded_body != body:
+                edits.append((i, j, command[i:i + opener] + folded_body + command[j - 1:j]))
+            if start is None:
+                start = i
+            continue
+        boundary = kind == "comment" or (kind == "char" and quote is None
+                                         and (command[i].isspace() or command[i] in ";&|<>()"))
+        if boundary:
+            if start is not None:
+                fold(start, i)
+                start = None
+        elif start is None:
+            start = i
+    if start is not None:
+        fold(start, len(command))
+    return _splice(command, edits)
 
 
 def _rewrite_resolved_user_home(command: str) -> str:
@@ -560,7 +618,10 @@ def _rewrite_resolved_user_home(command: str) -> str:
     try:
         # expanduser, realpath, and an explicit HOME — Windows expanduser uses USERPROFILE, not HOME.
         home = os.path.expanduser("~")
-        paths = [home, os.path.realpath(home), os.environ.get("HOME", "")]
+        paths = ([home, os.path.realpath(home)] if _home_prefix_fold_regex(home) is not None else [])
+        explicit_home = os.environ.get("HOME", "")
+        if _home_prefix_fold_regex(explicit_home) is not None:
+            paths.append(explicit_home)
     except Exception:
         return command
     return _fold_home_prefixes(command, paths, "~")
