@@ -1526,10 +1526,21 @@ def _sed_detection_sources(command: str):
     if "$IFS" in command or "${IFS" in command:
         edits = []
         ifs_re = re.compile(r'\$\{IFS\b[^}]*\}|\$IFS\b')
-        for kind, start, _, quote in _scan_shell(command, subst="u", brace=True):
-            if quote is None and kind in {"char", "subst"} and (match := ifs_re.match(command, start)):
-                edits.append((start, match.end(), " "))
-        command = _splice(command, edits)
+        pending_spans = [(0, len(command))]
+        while pending_spans:
+            begin, end = pending_spans.pop()
+            for kind, start, stop, quote in _scan_shell(command, begin, end, subst="uq", brace=True,
+                                                       comments=True):
+                if kind == "subst" and stop is not None and (
+                    command.startswith("$(", start) or command[start] == "`"
+                ):
+                    # Executable bodies have their own quote state; do not carry
+                    # the surrounding argument's quotes into the nested scan.
+                    opener = 2 if command.startswith("$(", start) else 1
+                    pending_spans.append((start + opener, stop - 1))
+                elif quote is None and kind in {"char", "subst"} and (match := ifs_re.match(command, start)):
+                    edits.append((start, match.end(), " "))
+        command = _splice(command, sorted(edits))
     pending, seen = [command], set()
     while pending:
         source = pending.pop()

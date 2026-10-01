@@ -21,6 +21,43 @@ def home(request, monkeypatch):
 
 
 class TestEnvrcAndProjectEnvInPlaceEdits:
+    @pytest.mark.parametrize("ifs", ["${IFS}", "$IFS"])
+    @pytest.mark.parametrize("carrier", ["$({body})", "`{body}`", '"$({body})"', '"`{body}`'])
+    @pytest.mark.parametrize("target", ["/etc/hosts", "~/.hermes/config.yaml", "~/.bashrc", "app/.envrc"])
+    @pytest.mark.parametrize("depth", [1, 8])
+    def test_sed_ifs_in_executable_substitution(self, detector, ifs, carrier, target, depth):
+        body = f"sed{ifs}-i s/a/b/ {target}"
+        for _ in range(depth - 1):
+            body = 'printf \'%s\' "$(' + body + ')"'
+        command = "printf '%s' " + carrier.format(body=body)
+        dangerous, key, reason = detector(command)
+        assert dangerous and key and reason, (command, (dangerous, key, reason))
+
+    @pytest.mark.parametrize("body", [
+        "sed${IFS}-n s/a/b/ ~/.hermes/config.yaml",
+        "sed$IFS-n s/a/b/ /etc/hosts",
+        "sed${IFS}-i s/a/b/ README.md",
+        "sed$IFS-i s/a/b/ ~/.bashrc.example",
+        "sed${IFS}-i s/a/b/ app/.envrc.example",
+        "sed${IFS}-i s/a/b/ ~/.hermes/config.yaml.example",
+        "sed'${IFS}'-i s/a/b/ ~/.hermes/config.yaml",
+        'sed"${IFS}"-i s/a/b/ ~/.hermes/config.yaml',
+        "sed'$IFS'-i s/a/b/ ~/.bashrc",
+        'sed"$IFS"-i s/a/b/ ~/.bashrc',
+        r"sed\${IFS}-i s/a/b/ /etc/hosts",
+        r"sed\$IFS-i s/a/b/ app/.envrc",
+        "sed${IFS_OTHER}-i s/a/b/ ~/.bashrc",
+        "sed$IFS_OTHER-i s/a/b/ app/.envrc",
+        "printf '%s' 'sed${IFS}-i s/a/b/ ~/.bashrc'",
+        'printf \'%s\' "sed${IFS}-i s/a/b/ app/.envrc"',
+        "printf '%s' '$(sed${IFS}-i s/a/b/ /etc/hosts)'",
+        "printf '%s' '`sed$IFS-i s/a/b/ ~/.hermes/config.yaml`'",
+    ])
+    @pytest.mark.parametrize("carrier", ["$({body})", "`{body}`", '"$({body})"', '"`{body}`'])
+    def test_sed_ifs_substitution_data_stays_safe(self, detector, body, carrier):
+        command = "printf '%s' " + carrier.format(body=body)
+        assert detector(command) == (False, None, None), command
+
     @pytest.mark.parametrize("spelling", ["spaced-posix", "native-drive", "native-unc"])
     def test_sed_home_operands_preserve_word_identity(self, detector, tmp_path, monkeypatch, spelling):
         native_separators = spelling != "spaced-posix"
