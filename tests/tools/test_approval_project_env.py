@@ -1,0 +1,107 @@
+"""Project env write contracts through both public detector import surfaces."""
+
+import pytest
+
+from tools import approval, approval_detection
+
+
+@pytest.fixture(params=[approval.detect_dangerous_command, approval_detection.detect_dangerous_command],
+                ids=["facade", "detection"])
+def detector(request, monkeypatch):
+    # Identity comparisons do not create files or execute the classified commands.
+    return request.param
+
+
+@pytest.fixture(params=["/root", "/home/security-test-user"])
+def home(request, monkeypatch):
+    monkeypatch.setenv("HOME", request.param)
+    return request.param
+
+
+class TestEnvrcAndProjectEnvInPlaceEdits:
+    @pytest.mark.parametrize("path", [".env", "app/.envrc", "~/.bashrc", "~/.hermes/config.yaml", "/etc/security-test"])
+    @pytest.mark.parametrize("flag,expected", [("-i", True), ("--in-place", True), ("--posix", False), ("-n", False)])
+    def test_sed_in_place_on_project_env_is_gated(self, detector, home, path, flag, expected):
+        result = detector(f"sed {flag} 's/a/b/' {path}")
+        assert result[0] is expected, result
+        assert bool(result[1]) is expected
+
+    @pytest.mark.parametrize("command,expected", [
+        ("sed -n -i 's/a/b/' .env", True),
+        ("sed -n --in-place 's/a/b/' .env", True),
+        ("sed -e 's/a/b/' -i app/.envrc", True),
+        ("sed -i -e 's/a/b/' .env", True),
+        ("sed -i -f program.sed .env", True),
+        ("sed -i --expression='s/a/b/' .env", True),
+        ("sed --file=program.sed --in-place=.bak .env", True),
+        ("sed -ne's/a/b/' -i.bak .env", True),
+        ("sed -ni 's/a/b/' .env", True),
+        ("sed -in 's/a/b/' .env", True),
+        ("sed -i -e .env README.md", False),
+        ("sed -i -f .env README.md", False),
+        ("sed -i --expression=.env README.md", False),
+        ("sed -i --file=.env README.md", False),
+        ("sed -e's/.env/i/' README.md", False),
+        ("sed -finput.sed .env", False),
+        ("sed -i -l .env 's/a/b/' README.md", False),
+        ("sed -i --line-length .env 's/a/b/' README.md", False),
+    ])
+    def test_sed_option_arguments_are_not_targets(self, detector, home, command, expected):
+        assert detector(command)[0] is expected
+
+    @pytest.mark.parametrize("command,expected", [
+        ("sed -i 's/a/b/' .env2>/tmp/out", False),
+        ("sed -i 's/a/b/' .env2 2>/tmp/out", False),
+        ("sed -i 's/a/b/' README.md < .env", False),
+        ("sed -i 's/a/b/' README.md 2>/tmp/out < app/.envrc", False),
+        ("sed -i 's/a/b/' README.md <.env", False),
+        ("sed -i 's/a/b/' .env < README.md", True),
+        ("sed${IFS}-i 's/a/b/' ~/.hermes/config.yaml", True),
+        ("echo 'sed${IFS}-i s/a/b/ .env'", False),
+        ("env -S \"sed -n -i -e s/a/b/ .env\"", True),
+        ("env --split-string='sed --in-place s/a/b/ app/.envrc'", True),
+        ("env -S \"sed --posix s/a/b/ .env\"", False),
+        ("sudo -- env MODE=placeholder command /usr/bin/sed -n -i 's/a/b/' './.env'", True),
+        ("sed -i -e 's/a/b/' -- .env", True),
+        ("sed -- -i .env", False),
+        ("sed -i 's/a/b/' -- .env", True),
+        ("sed -i 's/a/b/' README.md; cat .env", False),
+        ("echo \"sed -i s/a/b/ .env\"", False),
+        ("sed -i 's/.env/x/' README.md", False),
+        ("sed --in-place 's/a/b/' .environment", False),
+        ("sed -i 's/a/b/' .envrc.example", False),
+        ("sed -i 's/a/b/' notes.envrc.md", False),
+        ("sed -i 's/a/b/' .env-sample", False),
+        ("sed -i 's/a/b/' README.md # .env", False),
+        ("printf '%s' \"$(sed -ni 's/a/b/' .env)\"", True),
+        ("sed -i 's/a;|b/' 'app/.envrc'", True),
+        ("sed -i 's/a/b/' /srv/app/config.yaml", False),
+        ("sed -n '1,5p' .env", False),
+        ("sed 's/a/b/' .env > /tmp/out", False),
+    ])
+    def test_ordinary_sed_and_env_reads_stay_safe(self, detector, home, command, expected):
+        assert detector(command)[0] is expected
+
+    @pytest.mark.parametrize("path", ["~/.envrc", "./.envrc", "app/.envrc", ".envrc"])
+    @pytest.mark.parametrize("vector", [
+        "echo x >> {p}", "echo x > {p}", "echo x | tee -a {p}",
+        "cp placeholder {p}", "mv placeholder {p}", "install -m600 placeholder {p}",
+        "sed -i 's/a/b/' {p}", "sed --in-place 's/a/b/' {p}",
+    ])
+    def test_envrc_write_vectors_are_gated(self, detector, home, path, vector):
+        dangerous, key, reason = detector(vector.format(p=path))
+        assert dangerous and key and reason
+
+    @pytest.mark.parametrize("command", [
+        "echo x >> .env", "cp placeholder app/.env", "echo x > ~/.env.local",
+        "install -m600 placeholder ./.env.production",
+    ])
+    def test_env_variants_still_gated(self, detector, home, command):
+        assert detector(command)[0]
+
+    @pytest.mark.parametrize("command", [
+        "echo x >> ~/.environment", "echo x >> .env-sample",
+        "echo x >> .envrc.example", "cp a.txt ~/.envoy/config", "echo x >> notes.envrc.md",
+    ])
+    def test_near_miss_env_names_stay_safe(self, detector, home, command):
+        assert detector(command) == (False, None, None)

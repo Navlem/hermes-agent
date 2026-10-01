@@ -26,7 +26,8 @@ _HERMES_ENV_PATH = (
 _HERMES_CONFIG_PATH = (
     r'(?:~\/\.hermes/|(?:\$home|\$\{home\})/\.hermes/|(?:\$hermes_home|\$\{hermes_home\})/)' r'config\.yaml\b'
 )
-_PROJECT_ENV_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*\.env(?:\.[^/\s"\'`]+)*)'
+# direnv's .envrc is a separate basename, not a dotted .env variant.
+_PROJECT_ENV_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*\.env(?:rc|(?:\.[^/\s"\'`]+)*))'
 _PROJECT_CONFIG_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*config\.yaml)'
 _SHELL_RC_FILES = r'(?:~|\$home|\$\{home\})/\.' r'(?:bashrc|zshrc|profile|bash_profile|zprofile)\b'
 _CREDENTIAL_FILES = r'(?:~|\$home|\$\{home\})/\.' r'(?:netrc|pgpass|npmrc|pypirc)\b'
@@ -394,19 +395,9 @@ DANGEROUS_PATTERNS = [
     # with auto-approve. Same unpaired-door rationale as #14639 / the sed-tee-redirect pairing on these
     # targets. `authorized_keys` after the `~/.ssh/` fragment).
     (rf'\b(cp|mv|install)\b.*\s["\']?{_SENSITIVE_WRITE_TARGET}[^\s"\']*["\']?{_COMMAND_TAIL}', "copy/move file into sensitive credential/SSH/shell-rc path"),
-    # In-place edits mutate the file directly, bypassing redirection/tee/cp coverage; gate the same
-    # startup/credential files.
-    (rf'\bsed\s+-[^\s]*i.*(?:{_USER_SENSITIVE_WRITE_TARGET})[^\s"\']*', "in-place edit of sensitive credential/SSH/shell-rc path"),
-    (rf'\bsed\s+--in-place\b.*(?:{_USER_SENSITIVE_WRITE_TARGET})[^\s"\']*', "in-place edit of sensitive credential/SSH/shell-rc path (long flag)"),
+    # sed options and file operands are classified structurally below. The old
+    # regexes mistook --posix for -i and program/option arguments for write targets.
     (rf'\b(?:perl|ruby)\b.*(?:^|\s)-[^\s]*i\b.*(?:{_USER_SENSITIVE_WRITE_TARGET})[^\s"\']*', "in-place edit of sensitive credential/SSH/shell-rc path (perl/ruby)"),
-    (rf'\bsed\s+-[^\s]*i.*\s{_SYSTEM_CONFIG_PATH}', "in-place edit of system config"),
-    (rf'\bsed\s+--in-place\b.*\s{_SYSTEM_CONFIG_PATH}', "in-place edit of system config (long flag)"),
-    # sed -i on Hermes config/.env bypasses the redirection/tee rules; pairs the file_tools
-    # write_file/patch deny so the terminal side is not an open door.
-    # In-place edit of a Hermes-managed security file (~/.hermes/config.yaml or .env). sed -i bypasses the
-    # redirection/tee patterns above because it mutates the file directly. See #14639.
-    (rf'\bsed\s+-[^\s]*i.*(?:{_HERMES_CONFIG_PATH}|{_HERMES_ENV_PATH})', "in-place edit of Hermes config/env"),
-    (rf'\bsed\s+--in-place\b.*(?:{_HERMES_CONFIG_PATH}|{_HERMES_ENV_PATH})', "in-place edit of Hermes config/env (long flag)"),
     # perl/ruby -i: the flag may be its own token after other flags (`-p -i -e`), combined (`-pi`), or carry a backup
     # suffix (`-i.bak`), so match any flag token containing `i` anywhere; `perl -e '...'` (no -i) does not trip.
     # perl -i and ruby -i perform the same in-place mutation as sed -i but are not caught by the -e/-c
@@ -1521,12 +1512,120 @@ def _is_shell_token_spliced_gateway_lifecycle(command: str) -> bool:
     return contains_gateway_lifecycle_command(command)
 
 
+_SED_USER_TARGET_RE = re.compile(_USER_SENSITIVE_WRITE_TARGET, re.IGNORECASE)
+_SED_HERMES_TARGET_RE = re.compile(rf'(?:{_HERMES_CONFIG_PATH}|{_HERMES_ENV_PATH})', re.IGNORECASE)
+_SED_SYSTEM_TARGET_RE = re.compile(_SYSTEM_CONFIG_PATH, re.IGNORECASE)
+_SED_SSH_TARGET_RE = re.compile(_SSH_SENSITIVE_PATH, re.IGNORECASE)
+_SED_PROJECT_BASENAME_RE = re.compile(r'\.env(?:\.[^/]+)?|\.envrc', re.IGNORECASE)
+
+
+def _sed_detection_sources(command: str):
+    """Project env -S through its existing non-executing argv parser."""
+    # Unlike full normalization, this projection preserves raw control quotes.
+    # Only unquoted IFS expansion can split a shell word into sed and its flags.
+    if "$IFS" in command or "${IFS" in command:
+        edits = []
+        ifs_re = re.compile(r'\$\{IFS\b[^}]*\}|\$IFS\b')
+        for kind, start, _, quote in _scan_shell(command, subst="u", brace=True):
+            if quote is None and kind in {"char", "subst"} and (match := ifs_re.match(command, start)):
+                edits.append((start, match.end(), " "))
+        command = _splice(command, edits)
+    pending, seen = [command], set()
+    while pending:
+        source = pending.pop()
+        if source in seen:
+            continue
+        seen.add(source)
+        yield source
+        for start, _, word in _iter_shell_command_word_spans(source):
+            if os.path.basename(_deobfuscate_shell_word_for_detection(word)) != "env":
+                continue
+            tokens = _shell_segment_tokens(_shell_command_segment(source, start), 0)
+            if tokens and (payload := _env_split_payload(tokens)):
+                pending.append(payload)
+
+
+def _sed_command_tokens(segment: str) -> list[str] | None:
+    """Remove shell redirections, which never become sed input-file argv."""
+    edits, skip = [], -1
+    for kind, start, _, quote in _scan_shell(segment, subst="uq", brace=True):
+        if start < skip or quote is not None or kind != "char":
+            continue
+        # An IO-number prefix must begin a word. In `.env2>out`, 2 belongs
+        # to the filename; only the `>` is a redirection operator.
+        if segment[start].isdigit() and start and not segment[start - 1].isspace():
+            continue
+        if redirect := _SHELL_REDIRECTION_RE.match(segment, start):
+            _, skip, _ = _read_shell_word(segment, redirect.end())
+            edits.append((start, skip, " "))
+    return _shell_segment_tokens(_splice(segment, edits), 0)
+
+
+def _sed_in_place_findings(command: str):
+    """Inspect only actual sed commands, using the existing quote-aware scanner.
+
+    Option flags are case-sensitive. GNU -i owns the remainder of its short
+    bundle as an optional backup suffix (unlike -n); only file operands can
+    identify a protected target. No shell or editor is executed here.
+    """
+    for start, _, word in _iter_shell_command_word_spans(command):
+        if os.path.basename(_deobfuscate_shell_word_for_detection(word)) != "sed":
+            continue
+        args = _sed_command_tokens(_shell_command_segment(command, start))
+        if not args:
+            continue
+        in_place, options, explicit_program = False, True, False
+        operands = []
+        index = 1
+        while index < len(args):
+            token = args[index]
+            if options and token == "--":
+                options = False
+            elif options and token.startswith("--"):
+                option, equals, _ = token.partition("=")
+                if option == "--in-place":
+                    in_place = True
+                elif option in {"--expression", "--file", "--line-length"}:
+                    explicit_program = explicit_program or option in {"--expression", "--file"}
+                    if not equals:
+                        index += 1
+            elif options and token.startswith("-") and token != "-":
+                for offset, flag in enumerate(token[1:], 2):
+                    if flag == "i":
+                        in_place = True
+                        break  # the rest is GNU sed's optional backup suffix
+                    if flag in "efl":
+                        explicit_program = explicit_program or flag in "ef"
+                        if offset == len(token):
+                            index += 1
+                        break  # the rest (or next token) is this option's value
+            else:
+                operands.append(token)
+            index += 1
+        if not in_place:
+            continue
+        # Without -e/-f the first positional is sed's program, not an input file.
+        for operand in operands if explicit_program else operands[1:]:
+            target = _normalize_command_for_detection(operand)
+            if _SED_SYSTEM_TARGET_RE.match(target):
+                yield "in-place edit of system config"
+            elif _SED_HERMES_TARGET_RE.fullmatch(target):
+                yield "in-place edit of Hermes config/env"
+            elif _SED_SSH_TARGET_RE.match(target) or _SED_USER_TARGET_RE.fullmatch(target):
+                yield "in-place edit of sensitive credential/SSH/shell-rc path"
+            elif _SED_PROJECT_BASENAME_RE.fullmatch(os.path.basename(target)):
+                yield "in-place edit of project env file"
+
+
 def detect_dangerous_command(command: str) -> tuple:
     """Check dangerous patterns -> (is_dangerous, pattern_key, description)."""
     if _command_parser_limit_exceeded(command):
         return (True, _PARSER_LIMIT_DESCRIPTION, _PARSER_LIMIT_DESCRIPTION)
     if _is_verification_artifact_cleanup(command):
         return (False, None, None)
+    for source in _sed_detection_sources(command):
+        for description in _sed_in_place_findings(source):
+            return (True, description, description)
     for command_variant in _command_detection_variants(command):
         command_lower = _lower_preserving_flags(command_variant)
         masked_lower: str | None = None
