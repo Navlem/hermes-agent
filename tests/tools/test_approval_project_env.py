@@ -21,10 +21,18 @@ def home(request, monkeypatch):
 
 
 class TestEnvrcAndProjectEnvInPlaceEdits:
-    @pytest.mark.parametrize("native_separators", [False, True], ids=["spaced-posix", "native"])
-    def test_sed_home_operands_preserve_word_identity(self, detector, tmp_path, monkeypatch, native_separators):
-        user_home = str(tmp_path / ("user-home" if native_separators else "user home"))
-        hermes_home = str(tmp_path / ("hermes-home" if native_separators else "hermes home"))
+    @pytest.mark.parametrize("spelling", ["spaced-posix", "native-drive", "native-unc"])
+    def test_sed_home_operands_preserve_word_identity(self, detector, tmp_path, monkeypatch, spelling):
+        native_separators = spelling != "spaced-posix"
+        # Native path data must have a real drive or UNC root, not a POSIX
+        # tmp_path with its slashes replaced (which spells shell escapes).
+        if spelling == "native-drive":
+            user_home, hermes_home = r"C:\Users\sed-user", r"C:\Hermes\sed-profile"
+        elif spelling == "native-unc":
+            user_home, hermes_home = r"\\server\share\sed-user", r"\\server\share\sed-profile"
+        else:
+            user_home = str(tmp_path / "user home")
+            hermes_home = str(tmp_path / "hermes home")
         monkeypatch.setenv("HOME", user_home)
         monkeypatch.setenv("HERMES_HOME", hermes_home)
         for path in [user_home + "/.bashrc", hermes_home + "/config.yaml"]:
@@ -38,17 +46,30 @@ class TestEnvrcAndProjectEnvInPlaceEdits:
             assert detector(f"sed -i -e {operand} README.md") == (False, None, None)
             assert detector(f"sed -ni 's/a/b/' \"{path}.example\"") == (False, None, None)
 
+    def test_sed_driveless_backslashes_do_not_identify_posix_home(self, detector, tmp_path, monkeypatch):
+        user_home = str(tmp_path / "user-home")
+        monkeypatch.setenv("HOME", user_home)
+        operand = (user_home + "/.bashrc").replace("/", "\\")
+        assert detector(f"sed -ni 's/a/b/' {operand}") == (False, None, None)
+        assert detector(f"sed -ni 's/a/b/' '{user_home}/.bashrc'")[0]
+
     def test_sed_inventory_slash_marks_subtree_not_filename_prefix(self, detector, monkeypatch):
+        monkeypatch.setenv("HOME", "/home/sed-subtree-user")
         # Extend only this test's inventory, without importing another policy's names.
         inventory = approval_detection._SED_USER_TARGET_RE
         monkeypatch.setattr(approval_detection, "_SED_USER_TARGET_RE", re.compile(
-            rf"(?:{inventory.pattern}|~/\.sed-test-subtree/)", inventory.flags,
+            # Match the actual credential inventory's bare-root alternative:
+            # HOME lexical normalization removes a terminal slash.
+            rf"(?:{inventory.pattern}|~/\.sed-test-subtree(?:/|$))", inventory.flags,
         ))
         for path, expected in [
             ("~/.sed-test-subtree/", True),
+            ("~/.sed-test-subtree", True),
+            ("~/.sed-test-subtree/./", True),
             ("~/.sed-test-subtree/token", True),
             ("~/.sed-test-subtree/nested/token with spaces", True),
             ("~/.sed-test-subtree.example/token", False),
+            ("~/.sed-test-subtree/../notes/token", False),
             ("~/.bashrc", True),
             ("~/.bashrc.example", False),
             ("~/.bashrc/child", False),

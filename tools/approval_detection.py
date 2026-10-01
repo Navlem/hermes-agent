@@ -1545,8 +1545,8 @@ def _sed_detection_sources(command: str):
                 pending.append(payload)
 
 
-def _sed_command_tokens(segment: str) -> list[str] | None:
-    """Remove shell redirections, which never become sed input-file argv."""
+def _sed_command_tokens(segment: str) -> list[tuple[str, str]] | None:
+    """Remove redirections and retain each argv word's source provenance."""
     edits, skip = [], -1
     for kind, start, _, quote in _scan_shell(segment, subst="uq", brace=True):
         if start < skip or quote is not None or kind != "char":
@@ -1558,7 +1558,11 @@ def _sed_command_tokens(segment: str) -> list[str] | None:
         if redirect := _SHELL_REDIRECTION_RE.match(segment, start):
             _, skip, _ = _read_shell_word(segment, redirect.end())
             edits.append((start, skip, " "))
-    return _shell_segment_tokens(_splice(segment, edits), 0)
+    source = _splice(segment, edits)
+    tokens = _shell_tokens_with_spans(source, 0)
+    if tokens is None:
+        return None
+    return [(value, source[start:end]) for value, start, end, _ in tokens]
 
 
 def _sed_in_place_findings(command: str):
@@ -1583,7 +1587,7 @@ def _sed_in_place_findings(command: str):
         operands = []
         index = 1
         while index < len(args):
-            token = args[index]
+            token, raw = args[index]
             if options and token == "--":
                 options = False
             elif options and token.startswith("--"):
@@ -1605,14 +1609,15 @@ def _sed_in_place_findings(command: str):
                             index += 1
                         break  # the rest (or next token) is this option's value
             else:
-                operands.append(token)
+                operands.append(raw)
             index += 1
         if not in_place:
             continue
         # Without -e/-f the first positional is sed's program, not an input file.
         for operand in operands if explicit_program else operands[1:]:
-            # An argv operand is one word even when it contains spaces.
-            target = _strip_shell_word_syntax(_normalize_command_for_detection(shlex.quote(operand)))
+            # Normalize the original word, not a re-quoted decoded value: invented
+            # single quotes would turn unknown expansions into literal filenames.
+            target = _strip_shell_word_syntax(_normalize_command_for_detection(operand))
             user_target = _SED_USER_TARGET_RE.match(target)
             # A slash-terminated inventory match marks a protected subtree;
             # bare filename entries must still consume the entire operand.
