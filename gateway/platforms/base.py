@@ -1247,7 +1247,8 @@ def _validated_delivery_path(raw_path, session_key: str, label: str,
     report the drop instead of booking a delivery that never happened (#115908)."""
     raw = str(raw_path)
     safe_path = validate_media_delivery_path(raw, session_key=session_key)
-    if not safe_path:
+    if not safe_path and not _existing_regular_file(_normalize_media_tag_path(raw)):
+        # Remote retry is for host-missing artifacts, not rejected host secrets.
         from gateway.media_fetch import fetch_remote_media
         safe_path = fetch_remote_media(raw)
     if not safe_path:
