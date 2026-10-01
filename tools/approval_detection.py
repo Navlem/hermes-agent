@@ -575,8 +575,14 @@ def _fold_home_prefixes(command: str, paths, replacement: str) -> str:
             symbolic = re.match(r"^(?:~|\$HOME|\$\{HOME\})(?=/)", value)
             if symbolic and paths:
                 value = paths[0].replace("\\", "/") + value[symbolic.end():]
-        # This is lexical path equivalence only, not variable/glob expansion or symlink resolution.
-        if any(char in value for char in "$`*?[]{}"):
+        # Quote/escape provenance distinguishes literal filename characters from
+        # expansions. The supported leading HOME spelling has already been resolved.
+        home_syntax = (re.match(r"^[\"']?(?:~|\$HOME|\$\{HOME\})(?=/)", word)
+                       if replacement == "~" and paths else None)
+        if any(kind == "char" and (home_syntax is None or i >= home_syntax.end())
+               and ((quote != "'" and word[i] in "$`")
+                    or (quote is None and word[i] in "*?[]{}"))
+               for kind, i, _, quote in _scan_shell(word)):
             return
         value = posixpath.normpath(value)
         for pattern in patterns:

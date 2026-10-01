@@ -81,3 +81,49 @@ def test_non_home_paths_stay_allowed(home, path, operation, monkeypatch):
         "echo 'echo placeholder >> /root/.bashrc'",
     ):
         assert detect_dangerous_command(control) == (False, None, None)
+
+@pytest.mark.parametrize("home", ["/home/quality-user", "/root"])
+@pytest.mark.parametrize("literal", [
+    "key$literal", "key?literal", "key*literal", "key[literal]", "key{literal}", "key`literal`",
+])
+@pytest.mark.parametrize("quoting", ["single", "double", "escaped"])
+@pytest.mark.parametrize("operation", ["echo placeholder > {path}", "cp placeholder {path}", "sed -i 's/a/b/' {path}"])
+def test_literal_sensitive_descendants_keep_protection(home, literal, quoting, operation, monkeypatch):
+    """A literal special character does not undo an already known credential prefix."""
+    monkeypatch.setenv("HOME", home)
+
+    def render(path):
+        if quoting == "single":
+            return "'" + path + "'"
+        if quoting == "double":
+            return '"' + path.replace("$", "\\$").replace("`", "\\`") + '"'
+        return "".join("\\" + ch if ch in "$`*?[]{}" else ch for ch in path)
+
+    control = detect_dangerous_command(operation.format(path=render("~/.ssh/" + literal)))
+    assert control[0] and control[1] is not None
+    assert detect_dangerous_command(operation.format(path=render(home + "/.ssh/" + literal))) == control
+    for path in (
+        home + "/notes/" + literal,
+        home + "/.ssh-backup/" + literal,
+        home + "-other/.ssh/" + literal,
+        "/srv" + home + "/.ssh/" + literal,
+        home + "/.ssh/../notes/" + literal,
+    ):
+        assert detect_dangerous_command(operation.format(path=render(path))) == (False, None, None), path
+    for read in ("cat {path}", "cp {path} ordinary-backup", "sed -n '1p' {path}"):
+        assert detect_dangerous_command(read.format(path=render(home + "/.ssh/" + literal))) == (False, None, None)
+
+
+@pytest.mark.parametrize("home", ["/home/quality-user", "/root"])
+@pytest.mark.parametrize("dynamic", [
+    "$UNKNOWN", "`unknown`", "*", "?", "[ab]", "{a,b}",
+    '"$UNKNOWN"', '"`unknown`"',
+])
+@pytest.mark.parametrize("operation", [
+    "echo placeholder > {path}", "cp placeholder {path}", "sed -i 's/a/b/' {path}",
+])
+def test_unknown_expansions_are_not_lexically_resolved(home, dynamic, operation, monkeypatch):
+    """Do not collapse .. across an unknown shell expansion into a protected path."""
+    monkeypatch.setenv("HOME", home)
+    path = home + "/notes/" + dynamic + "/../../.ssh/id_rsa"
+    assert detect_dangerous_command(operation.format(path=path)) == (False, None, None)
