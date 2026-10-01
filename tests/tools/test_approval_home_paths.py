@@ -127,3 +127,48 @@ def test_unknown_expansions_are_not_lexically_resolved(home, dynamic, operation,
     monkeypatch.setenv("HOME", home)
     path = home + "/notes/" + dynamic + "/../../.ssh/id_rsa"
     assert detect_dangerous_command(operation.format(path=path)) == (False, None, None)
+
+
+@pytest.mark.parametrize("home", [r"C:\Users\quality-user", r"\\server\share\quality-user"])
+@pytest.mark.parametrize("dynamic", ["*", "$UNKNOWN"])
+def test_native_separator_unknown_expansions_stay_unresolved(home, dynamic, monkeypatch):
+    """Native separators must not hide unknown syntax before lexical traversal."""
+    monkeypatch.setenv("HOME", home)
+    path = home + "\\notes\\" + dynamic + r"\..\..\.ssh\id_rsa"
+    for spelling in (path, path.replace("\\", "/")):
+        assert detect_dangerous_command("cp input " + spelling) == (False, None, None)
+    for relative in (r"\notes\out.txt", r"\.ssh-backup\id_rsa", r"\.ssh\..\notes.txt"):
+        assert detect_dangerous_command("cp input " + home + relative) == (False, None, None)
+
+
+@pytest.mark.parametrize("home", [r"C:\Users\quality-user", r"\\server\share\quality-user"])
+@pytest.mark.parametrize("special,quote,resolved", [
+    ("*", "'", True), ("$UNKNOWN", "'", True), ("`unknown`", "'", True),
+    ("?", "'", True), ("[ab]", "'", True), ("{a,b}", "'", True),
+    ("*", '"', True), ("?", '"', True), ("[ab]", '"', True), ("{a,b}", '"', True),
+    ("$UNKNOWN", '"', False), ("`unknown`", '"', False),
+])
+def test_native_separator_quote_provenance(home, special, quote, resolved, monkeypatch):
+    """Keep native single-quoted syntax and double-quoted globs literal."""
+    monkeypatch.setenv("HOME", home)
+    path = home + "\\notes\\" + special + r"\..\..\.ssh\id_rsa"
+    control = detect_dangerous_command("cp input ~/.ssh/id_rsa")
+    assert control[0] and control[1] is not None
+    expected = control if resolved else (False, None, None)
+    for spelling in (path, path.replace("\\", "/")):
+        assert detect_dangerous_command("cp input " + quote + spelling + quote) == expected
+    ordinary = home + "\\notes\\" + special + r"\..\..\out.txt"
+    assert detect_dangerous_command("cp input " + quote + ordinary + quote) == (False, None, None)
+
+
+@pytest.mark.parametrize("home", ["/home/quality-user", "/root"])
+@pytest.mark.parametrize("literal", [r"\*", r"\$UNKNOWN", r"\?", r"\[ab\]", r"\{a,b\}", r"\`unknown\`"])
+def test_posix_escaped_literals_keep_provenance(home, literal, monkeypatch):
+    """Native separator projection must not consume POSIX literal escapes."""
+    monkeypatch.setenv("HOME", home)
+    path = home + "/notes/" + literal + "/../../.ssh/id_rsa"
+    control = detect_dangerous_command("cp input ~/.ssh/id_rsa")
+    assert control[0] and control[1] is not None
+    assert detect_dangerous_command("cp input " + path) == control
+    ordinary = home + "/notes/" + literal + "/../../out.txt"
+    assert detect_dangerous_command("cp input " + ordinary) == (False, None, None)

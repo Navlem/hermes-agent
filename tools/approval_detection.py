@@ -579,10 +579,12 @@ def _fold_home_prefixes(command: str, paths, replacement: str) -> str:
         # expansions. The supported leading HOME spelling has already been resolved.
         home_syntax = (re.match(r"^[\"']?(?:~|\$HOME|\$\{HOME\})(?=/)", word)
                        if replacement == "~" and paths else None)
+        # Match the decoder's native separator mode without losing quote provenance.
+        provenance = word.replace("\\", "/") if windows else word
         if any(kind == "char" and (home_syntax is None or i >= home_syntax.end())
-               and ((quote != "'" and word[i] in "$`")
-                    or (quote is None and word[i] in "*?[]{}"))
-               for kind, i, _, quote in _scan_shell(word)):
+               and ((quote != "'" and provenance[i] in "$`")
+                    or (quote is None and provenance[i] in "*?[]{}"))
+               for kind, i, _, quote in _scan_shell(provenance)):
             return
         value = posixpath.normpath(value)
         for pattern in patterns:
