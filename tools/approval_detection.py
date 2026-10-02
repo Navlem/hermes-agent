@@ -1602,6 +1602,14 @@ _SED_HERMES_TARGET_RE = re.compile(rf'(?:{_HERMES_CONFIG_PATH}|{_HERMES_ENV_PATH
 _SED_SYSTEM_TARGET_RE = re.compile(_SYSTEM_CONFIG_PATH, re.IGNORECASE)
 _SED_SSH_TARGET_RE = re.compile(_SSH_SENSITIVE_PATH, re.IGNORECASE)
 _SED_PROJECT_BASENAME_RE = re.compile(r'\.env(?:\.[^/]+)?|\.envrc', re.IGNORECASE)
+# GNU sed's complete long-option namespace: --f is ambiguous with
+# --follow-symlinks, whereas --fil uniquely owns a program filename.
+_SED_LONG_OPTIONS = (
+    "--binary", "--debug", "--expression", "--file", "--follow-symlinks",
+    "--help", "--in-place", "--line-length", "--null-data", "--posix",
+    "--quiet", "--regexp-extended", "--sandbox", "--separate", "--silent",
+    "--unbuffered", "--version",
+)
 
 
 def _sed_detection_sources(command: str):
@@ -1688,6 +1696,14 @@ def _sed_in_place_findings(command: str):
                 options = False
             elif options and token.startswith("--"):
                 option, equals, _ = token.partition("=")
+                matches = [name for name in _SED_LONG_OPTIONS if name.startswith(option)]
+                if len(matches) != 1:
+                    in_place = False  # GNU sed rejects unknown/ambiguous options.
+                    break
+                option = matches[0]
+                if equals and option not in {"--in-place", "--expression", "--file", "--line-length"}:
+                    in_place = False  # No-argument options cannot own an attached value.
+                    break
                 if option == "--in-place":
                     in_place = True
                 elif option in {"--expression", "--file", "--line-length"}:
