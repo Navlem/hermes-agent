@@ -27,6 +27,16 @@ _HERMES_ENV_PATH = (
 _HERMES_CONFIG_PATH = (
     r'(?:~\/\.hermes/|(?:\$home|\$\{home\})/\.hermes/|(?:\$hermes_home|\$\{hermes_home\})/)' r'config\.yaml\b'
 )
+# Credential stores only, not ordinary Hermes logs, skills, or transcript state.
+_HERMES_CREDENTIAL_SUFFIX = (
+    r'(?:(?:mcp-tokens|pairing)(?:/|(?=[\s;&|<>"\']|$))|'
+    r'\.anthropic_oauth\.json(?=[\s;&|<>"\']|$))'
+)
+_HERMES_CREDENTIAL_PATH = (
+    r'(?:~\/\.hermes/|(?:\$home|\$\{home\})/\.hermes/|(?:\$hermes_home|\$\{hermes_home\})/)'
+    + _HERMES_CREDENTIAL_SUFFIX
+)
+_HERMES_CREDENTIAL_TAIL_RE = re.compile(r'[/\\]' + _HERMES_CREDENTIAL_SUFFIX, re.IGNORECASE)
 # direnv's .envrc is a separate basename, not a dotted .env variant.
 _PROJECT_ENV_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*\.env(?:rc|(?:\.[^/\s"\'`]+)*))'
 _PROJECT_CONFIG_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*config\.yaml)'
@@ -46,9 +56,9 @@ _MACOS_PRIVATE_SYSTEM_PATH = r'/private/(?:etc|var|tmp|home)/'
 _SYSTEM_CONFIG_PATH = rf'(?:/etc/|{_MACOS_PRIVATE_SYSTEM_PATH})'
 _SENSITIVE_WRITE_TARGET = (
     rf'(?:{_SYSTEM_CONFIG_PATH}|/dev/sd|{_SSH_SENSITIVE_PATH}|{_HERMES_ENV_PATH}|{_HERMES_CONFIG_PATH}|'
-    rf'{_SHELL_RC_FILES}|{_CREDENTIAL_FILES})'
+    rf'{_SHELL_RC_FILES}|{_CREDENTIAL_FILES}|{_HERMES_CREDENTIAL_PATH})'
 )
-_USER_SENSITIVE_WRITE_TARGET = rf'(?:{_SSH_SENSITIVE_PATH}|{_SHELL_RC_FILES}|{_CREDENTIAL_FILES})'
+_USER_SENSITIVE_WRITE_TARGET = rf'(?:{_SSH_SENSITIVE_PATH}|{_SHELL_RC_FILES}|{_CREDENTIAL_FILES}|{_HERMES_CREDENTIAL_PATH})'
 _PROJECT_SENSITIVE_WRITE_TARGET = rf'(?:{_PROJECT_ENV_PATH}|{_PROJECT_CONFIG_PATH})'
 # cp/mv/install: the sensitive path is a write target only as the LAST argument (destination), so
 # `cp config.yaml backup.yaml` (config.yaml as SOURCE) stays out.
@@ -569,7 +579,7 @@ def _home_path_word_projection(word: str) -> str:
     return _splice(word, edits)
 
 
-def _fold_home_prefixes(command: str, paths, replacement: str) -> str:
+def _fold_home_prefixes(command: str, paths, replacement: str, *, tail_pattern=None) -> str:
     """Fold only a shell word's absolute prefix, never a substring of another path."""
     patterns = [pattern for path in dict.fromkeys(sorted((p for p in paths if p), key=len, reverse=True))
                 if (pattern := _home_prefix_fold_regex(path)) is not None]
@@ -596,7 +606,7 @@ def _fold_home_prefixes(command: str, paths, replacement: str) -> str:
         value = posixpath.normpath(value)
         for pattern in patterns:
             match = pattern.fullmatch(value)
-            if match:
+            if match and (tail_pattern is None or tail_pattern.match(match.group("tail").replace("\\", "/"))):
                 folded = replacement + match.group("tail").replace("\\", "/")
                 # Don't introduce quotes into an ordinary bare operand: legacy rules for
                 # options after operands deliberately stop at quoted prose.
@@ -609,7 +619,7 @@ def _fold_home_prefixes(command: str, paths, replacement: str) -> str:
         if kind == "subst":
             opener = 2 if command.startswith("$(", i) else 1
             body = command[i + opener:j - 1]
-            folded_body = _fold_home_prefixes(body, paths, replacement)
+            folded_body = _fold_home_prefixes(body, paths, replacement, tail_pattern=tail_pattern)
             if folded_body != body:
                 edits.append((i, j, command[i:i + opener] + folded_body + command[j - 1:j]))
             if start is None:
@@ -643,15 +653,21 @@ def _rewrite_resolved_user_home(command: str) -> str:
 
 
 def _rewrite_resolved_hermes_home(command: str) -> str:
-    """Resolved HERMES_HOME (and its realpath) -> ``~/.hermes/`` so the _HERMES_CONFIG_PATH /
-    _HERMES_ENV_PATH rules match Docker/gateway deployments that spell the absolute path."""
+    """Fold the active home, plus credential stores at the actual global root.
+
+    Root-only folding is store-specific: do not broaden unrelated config/env or
+    ordinary state rules when a named profile is active. Resolve both homes live.
+    """
     try:
-        from hermes_constants import get_hermes_home
+        from hermes_constants import get_default_hermes_root, get_hermes_home
         home = get_hermes_home().expanduser()
         paths = [str(home), str(home.resolve(strict=False))]
+        root = get_default_hermes_root().expanduser()
+        root_paths = [str(root), str(root.resolve(strict=False))]
     except Exception:
         return command
-    return _fold_home_prefixes(command, paths, "~/.hermes")
+    command = _fold_home_prefixes(command, paths, "~/.hermes")
+    return _fold_home_prefixes(command, root_paths, "~/.hermes", tail_pattern=_HERMES_CREDENTIAL_TAIL_RE)
 
 
 _PARAM_REPLACEMENT_RE = re.compile(r"\$\{[^}/\s]+/[^}/]*/(?P<replacement>[^}]*)\}")
