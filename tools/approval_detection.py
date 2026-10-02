@@ -556,6 +556,28 @@ def _home_prefix_fold_regex(path: str):
     return re.compile(root + r"[/\\]+".join(re.escape(c) for c in components) + _PATH_TAIL)
 
 
+def _home_path_word_projection(word: str) -> str:
+    """Use one separator/escape spelling for both decoding and provenance checks.
+
+    Native-rooted drive/UNC words retain native separators. Forward-drive words
+    also accept historical mixed directory separators, but backslashes escaping
+    shell syntax remain escapes; a drive prefix alone does not make them native.
+    POSIX words keep the shared shell scanner's escape semantics unchanged.
+    """
+    unquoted = word.strip("'\"")
+    if re.match(r"^[A-Za-z]:\\", unquoted) or unquoted.startswith("\\\\"):
+        return word.replace("\\", "/")
+    if not re.match(r"^[A-Za-z]:/", unquoted):
+        return word
+    edits = []
+    for kind, i, j, _ in _scan_shell(word):
+        if kind == "esc" and word[i + 1] not in "$`*?[]{}'\";&|<>()" and not word[i + 1].isspace():
+            edits.append((i, j, "/" + word[i + 1:j].replace("\\", "/")))
+        elif kind == "char" and word[i] == "\\":
+            edits.append((i, j, "/"))
+    return _splice(word, edits)
+
+
 def _fold_home_prefixes(command: str, paths, replacement: str) -> str:
     """Fold only a shell word's absolute prefix, never a substring of another path."""
     patterns = [pattern for path in dict.fromkeys(sorted((p for p in paths if p), key=len, reverse=True))
@@ -564,14 +586,8 @@ def _fold_home_prefixes(command: str, paths, replacement: str) -> str:
 
     def fold(start: int, end: int) -> None:
         word = command[start:end]
-        # Backslash-rooted drive/UNC spellings use native separators. Forward-drive
-        # words retain shell escape provenance in both decoding and expansion checks.
-        unquoted = word.strip("'\"")
-        windows = re.match(r"^[A-Za-z]:\\", unquoted) or unquoted.startswith("\\\\")
-        value = ("".join(word[i:j] for kind, i, j, _ in _scan_shell(word) if kind != "quote")
-                 if windows else _strip_shell_word_syntax(word))
-        if windows:
-            value = value.replace("\\", "/")
+        provenance = _home_path_word_projection(word)
+        value = _strip_shell_word_syntax(provenance)
         if replacement == "~":
             symbolic = re.match(r"^(?:~|\$HOME|\$\{HOME\})(?=/)", value)
             if symbolic and paths:
@@ -580,8 +596,7 @@ def _fold_home_prefixes(command: str, paths, replacement: str) -> str:
         # expansions. The supported leading HOME spelling has already been resolved.
         home_syntax = (re.match(r"^[\"']?(?:~|\$HOME|\$\{HOME\})(?=/)", word)
                        if replacement == "~" and paths else None)
-        # Match the decoder's native separator mode without losing quote provenance.
-        provenance = word.replace("\\", "/") if windows else word
+        # The same projection supplies decoded values and lexical provenance.
         if any(kind == "char" and (home_syntax is None or i >= home_syntax.end())
                and ((quote != "'" and provenance[i] in "$`")
                     or (quote is None and provenance[i] in "*?[]{}"))

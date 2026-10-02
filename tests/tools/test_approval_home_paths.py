@@ -82,7 +82,7 @@ def test_non_home_paths_stay_allowed(home, path, operation, monkeypatch):
     ):
         assert detect_dangerous_command(control) == (False, None, None)
 
-@pytest.mark.parametrize("home", ["/home/quality-user", "/root"])
+@pytest.mark.parametrize("home", ["/home/quality-user", "/root", "C:/Accounts/quality-user", "//server/share/quality-user"])
 @pytest.mark.parametrize("literal", [
     "key$literal", "key?literal", "key*literal", "key[literal]", "key{literal}", "key`literal`",
 ])
@@ -114,10 +114,10 @@ def test_literal_sensitive_descendants_keep_protection(home, literal, quoting, o
         assert detect_dangerous_command(read.format(path=render(home + "/.ssh/" + literal))) == (False, None, None)
 
 
-@pytest.mark.parametrize("home", ["/home/quality-user", "/root"])
+@pytest.mark.parametrize("home", ["/home/quality-user", "/root", "C:/Users/quality-user", "//server/share/quality-user"])
 @pytest.mark.parametrize("dynamic", [
     "$UNKNOWN", "`unknown`", "*", "?", "[ab]", "{a,b}",
-    '"$UNKNOWN"', '"`unknown`"',
+    '"$UNKNOWN"', '"`unknown`"', '$(unknown)', '"$(unknown)"',
 ])
 @pytest.mark.parametrize("operation", [
     "echo placeholder > {path}", "cp placeholder {path}", "sed -i 's/a/b/' {path}",
@@ -127,18 +127,25 @@ def test_unknown_expansions_are_not_lexically_resolved(home, dynamic, operation,
     monkeypatch.setenv("HOME", home)
     path = home + "/notes/" + dynamic + "/../../.ssh/id_rsa"
     assert detect_dangerous_command(operation.format(path=path)) == (False, None, None)
+    ordinary = home + "/notes/" + dynamic + "/../../out.txt"
+    assert detect_dangerous_command(operation.format(path=ordinary)) == (False, None, None)
+    for read in ("cat {path}", "cp {path} ordinary-backup", "sed -n '1p' {path}"):
+        assert detect_dangerous_command(read.format(path=path)) == (False, None, None)
 
 
 @pytest.mark.parametrize("home", [r"C:\Users\quality-user", r"\\server\share\quality-user"])
-@pytest.mark.parametrize("dynamic", ["*", "$UNKNOWN"])
-def test_native_separator_unknown_expansions_stay_unresolved(home, dynamic, monkeypatch):
+@pytest.mark.parametrize("dynamic", ["*", "$UNKNOWN", "?", "key?literal", "[ab]", "{a,b}", "`unknown`"])
+@pytest.mark.parametrize("operation", ["echo placeholder > {path}", "cp input {path}", "sed -i 's/a/b/' {path}"])
+def test_native_separator_unknown_expansions_stay_unresolved(home, dynamic, operation, monkeypatch):
     """Native separators must not hide unknown syntax before lexical traversal."""
     monkeypatch.setenv("HOME", home)
     path = home + "\\notes\\" + dynamic + r"\..\..\.ssh\id_rsa"
     for spelling in (path, path.replace("\\", "/")):
-        assert detect_dangerous_command("cp input " + spelling) == (False, None, None)
+        assert detect_dangerous_command(operation.format(path=spelling)) == (False, None, None)
+        for read in ("cat {path}", "cp {path} ordinary-backup", "sed -n '1p' {path}"):
+            assert detect_dangerous_command(read.format(path=spelling)) == (False, None, None)
     for relative in (r"\notes\out.txt", r"\.ssh-backup\id_rsa", r"\.ssh\..\notes.txt"):
-        assert detect_dangerous_command("cp input " + home + relative) == (False, None, None)
+        assert detect_dangerous_command(operation.format(path=home + relative)) == (False, None, None)
 
 
 @pytest.mark.parametrize("home", [r"C:\Users\quality-user", r"\\server\share\quality-user"])
@@ -148,30 +155,36 @@ def test_native_separator_unknown_expansions_stay_unresolved(home, dynamic, monk
     ("*", '"', True), ("?", '"', True), ("[ab]", '"', True), ("{a,b}", '"', True),
     ("$UNKNOWN", '"', False), ("`unknown`", '"', False),
 ])
-def test_native_separator_quote_provenance(home, special, quote, resolved, monkeypatch):
+@pytest.mark.parametrize("operation", ["echo placeholder > {path}", "cp input {path}", "sed -i 's/a/b/' {path}"])
+def test_native_separator_quote_provenance(home, special, quote, resolved, operation, monkeypatch):
     """Keep native single-quoted syntax and double-quoted globs literal."""
     monkeypatch.setenv("HOME", home)
     path = home + "\\notes\\" + special + r"\..\..\.ssh\id_rsa"
-    control = detect_dangerous_command("cp input ~/.ssh/id_rsa")
+    control = detect_dangerous_command(operation.format(path="~/.ssh/id_rsa"))
     assert control[0] and control[1] is not None
     expected = control if resolved else (False, None, None)
     for spelling in (path, path.replace("\\", "/")):
-        assert detect_dangerous_command("cp input " + quote + spelling + quote) == expected
+        assert detect_dangerous_command(operation.format(path=quote + spelling + quote)) == expected
+        for read in ("cat {path}", "cp {path} ordinary-backup", "sed -n '1p' {path}"):
+            assert detect_dangerous_command(read.format(path=quote + spelling + quote)) == (False, None, None)
     ordinary = home + "\\notes\\" + special + r"\..\..\out.txt"
-    assert detect_dangerous_command("cp input " + quote + ordinary + quote) == (False, None, None)
+    assert detect_dangerous_command(operation.format(path=quote + ordinary + quote)) == (False, None, None)
 
 
 @pytest.mark.parametrize("home", ["/home/quality-user", "/root"])
 @pytest.mark.parametrize("literal", [r"\*", r"\$UNKNOWN", r"\?", r"\[ab\]", r"\{a,b\}", r"\`unknown\`"])
-def test_posix_escaped_literals_keep_provenance(home, literal, monkeypatch):
+@pytest.mark.parametrize("operation", ["echo placeholder > {path}", "cp input {path}", "sed -i 's/a/b/' {path}"])
+def test_posix_escaped_literals_keep_provenance(home, literal, operation, monkeypatch):
     """Native separator projection must not consume POSIX literal escapes."""
     monkeypatch.setenv("HOME", home)
     path = home + "/notes/" + literal + "/../../.ssh/id_rsa"
-    control = detect_dangerous_command("cp input ~/.ssh/id_rsa")
+    control = detect_dangerous_command(operation.format(path="~/.ssh/id_rsa"))
     assert control[0] and control[1] is not None
-    assert detect_dangerous_command("cp input " + path) == control
+    assert detect_dangerous_command(operation.format(path=path)) == control
+    for read in ("cat {path}", "cp {path} ordinary-backup", "sed -n '1p' {path}"):
+        assert detect_dangerous_command(read.format(path=path)) == (False, None, None)
     ordinary = home + "/notes/" + literal + "/../../out.txt"
-    assert detect_dangerous_command("cp input " + ordinary) == (False, None, None)
+    assert detect_dangerous_command(operation.format(path=ordinary)) == (False, None, None)
 
 
 @pytest.mark.parametrize("path", [
@@ -190,7 +203,48 @@ def test_forward_drive_escaped_literals_preserve_read_boundary(path, operation, 
                     r'"C:\Users\quality-user\.ssh\id_rsa"',
                     path.replace("/.ssh/", "/notes/")):
         assert detect_dangerous_command(operation.format(path=control)) == allowed
-    for write in ("cp input {path}", "sed -i 's/a/b/' {path}"):
+    for write in ("echo placeholder > {path}", "cp input {path}", "sed -i 's/a/b/' {path}"):
         protected = detect_dangerous_command(write.format(path=path))
         assert protected[0] and protected[1] is not None
     assert detect_dangerous_command(operation.format(path=path)) == allowed
+
+
+@pytest.mark.parametrize("path", [r"C:/Accounts/tester\.bashrc", r"C:/Accounts\tester/.bashrc"])
+@pytest.mark.parametrize("quote", ["", '"'])
+@pytest.mark.parametrize("operation", ["echo placeholder > {path}", "cp placeholder {path}", "sed -i 's/a/b/' {path}"])
+def test_mixed_separator_home_writes_keep_protection(path, quote, operation, monkeypatch):
+    """The exact twelve lost mixed-separator writes retain operation-specific verdicts."""
+    monkeypatch.setenv("HOME", "C:/Accounts/tester")
+    control = detect_dangerous_command(operation.format(path="~/.bashrc"))
+    assert control[0] and control[1] is not None
+    operand = quote + path + quote
+    assert detect_dangerous_command(operation.format(path=operand)) == control
+    ordinary = quote + path.replace(".bashrc", "notes.txt") + quote
+    assert detect_dangerous_command(operation.format(path=ordinary)) == (False, None, None)
+    for read in ("cat {path}", "cp {path} ordinary-backup", "sed -n '1p' {path}"):
+        assert detect_dangerous_command(read.format(path=operand)) == (False, None, None)
+
+
+@pytest.mark.parametrize("literal", [
+    "key$literal", "key?literal", "key*literal", "key[literal]", "key{literal}", "key`literal`",
+])
+@pytest.mark.parametrize("quoting", ["single", "double", "escaped"])
+@pytest.mark.parametrize("operation", ["echo placeholder > {path}", "cp input {path}", "sed -i 's/a/b/' {path}"])
+def test_forward_drive_literal_families_keep_operation_boundary(literal, quoting, operation, monkeypatch):
+    """The Windows SSH fallback must not replace the known HOME write boundary."""
+    monkeypatch.setenv("HOME", "C:/Users/quality-user")
+
+    def render(path):
+        if quoting == "single":
+            return "'" + path + "'"
+        if quoting == "double":
+            return '"' + path.replace("$", "\\$").replace("`", "\\`") + '"'
+        return "".join("\\" + ch if ch in "$`*?[]{}" else ch for ch in path)
+
+    path = render("C:/Users/quality-user/.ssh/" + literal)
+    control = detect_dangerous_command(operation.format(path=render("~/.ssh/" + literal)))
+    assert control[0] and control[1] is not None
+    assert detect_dangerous_command(operation.format(path=path)) == control
+    assert detect_dangerous_command(operation.format(path=render("C:/Users/quality-user/notes/" + literal))) == (False, None, None)
+    for read in ("cat {path}", "cp {path} ordinary-backup", "sed -n '1p' {path}"):
+        assert detect_dangerous_command(read.format(path=path)) == (False, None, None)
