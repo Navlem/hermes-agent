@@ -172,3 +172,25 @@ def test_posix_escaped_literals_keep_provenance(home, literal, monkeypatch):
     assert detect_dangerous_command("cp input " + path) == control
     ordinary = home + "/notes/" + literal + "/../../out.txt"
     assert detect_dangerous_command("cp input " + ordinary) == (False, None, None)
+
+
+@pytest.mark.parametrize("path", [
+    pytest.param('"C:/Users/quality-user/.ssh/key\\$literal"', id="double-quoted-dollar"),
+    pytest.param(r"C:/Users/quality-user/.ssh/key\$literal", id="escaped-dollar"),
+    pytest.param(r"C:/Users/quality-user/.ssh/key\?literal", id="escaped-question"),
+])
+@pytest.mark.parametrize("operation", [
+    "cat {path}", "cp {path} ordinary-backup", "sed -n '1p' {path}",
+])
+def test_forward_drive_escaped_literals_preserve_read_boundary(path, operation, monkeypatch):
+    """Literal escapes must not turn read operands into Windows SSH access prompts."""
+    monkeypatch.setenv("HOME", "C:/Users/quality-user")
+    allowed = (False, None, None)
+    for control in ('"C:/Users/quality-user/.ssh/id_rsa"',
+                    r'"C:\Users\quality-user\.ssh\id_rsa"',
+                    path.replace("/.ssh/", "/notes/")):
+        assert detect_dangerous_command(operation.format(path=control)) == allowed
+    for write in ("cp input {path}", "sed -i 's/a/b/' {path}"):
+        protected = detect_dangerous_command(write.format(path=path))
+        assert protected[0] and protected[1] is not None
+    assert detect_dangerous_command(operation.format(path=path)) == allowed

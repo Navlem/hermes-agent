@@ -564,9 +564,10 @@ def _fold_home_prefixes(command: str, paths, replacement: str) -> str:
 
     def fold(start: int, end: int) -> None:
         word = command[start:end]
-        # Native drive/UNC spellings use backslashes as separators, not shell escapes.
+        # Backslash-rooted drive/UNC spellings use native separators. Forward-drive
+        # words retain shell escape provenance in both decoding and expansion checks.
         unquoted = word.strip("'\"")
-        windows = re.match(r"^[A-Za-z]:[/\\]", unquoted) or unquoted.startswith("\\\\")
+        windows = re.match(r"^[A-Za-z]:\\", unquoted) or unquoted.startswith("\\\\")
         value = ("".join(word[i:j] for kind, i, j, _ in _scan_shell(word) if kind != "quote")
                  if windows else _strip_shell_word_syntax(word))
         if windows:
